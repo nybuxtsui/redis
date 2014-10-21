@@ -2,7 +2,6 @@ package redis
 
 import (
 	"errors"
-	"fmt"
 	"github.com/garyburd/redigo/redis"
 	"github.com/nybuxtsui/log"
 	"strings"
@@ -92,13 +91,13 @@ func (pool *RedisPool) Exec(cmd string, args ...interface{}) (interface{}, error
 	return resp.reply, resp.err
 }
 
-func (pool *RedisPool) NewAddr(addr poolAddr) {
-	log.Debug("NewAddr|%v", addr)
-	pool.addrCh <- addr
+func (pool *RedisPool) NewAddr(addr []string, pwd string) {
+	log.Debug("NewAddr%v|%v|%v", addr, pwd)
+	pool.addrCh <- poolAddr{addr, pwd}
 }
 
 func makeConn(addr, pwd string) (conn *redisConn, err error) {
-	log.Info("makeConn|%v", addr)
+	log.Info("makeConn|%v|%v", addr, pwd)
 	conn = nil
 	const dataTimeout = 5 * time.Second
 	const connTimeout = 2 * time.Second
@@ -368,4 +367,3 @@ func (pool *RedisPool) start() {
 	go pool.bgWorker()
 	go pool.process()
 }
-
