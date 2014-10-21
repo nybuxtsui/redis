@@ -10,8 +10,7 @@ import (
 )
 
 const (
-	fullCheckInterval = 20
-	pingInterval      = 60
+	pingInterval = 60
 )
 
 type redisResp struct {
@@ -38,7 +37,8 @@ type poolAddr struct {
 	pwd   string
 }
 
-type RedisPool struct {
+// Pool redis连接池对象
+type Pool struct {
 	connCh      chan *redisConn
 	badCh       chan *redisConn
 	reqCh       chan *redisReq
@@ -50,6 +50,7 @@ type RedisPool struct {
 }
 
 var (
+	// ErrTimeout 服务太忙或者所有的连接都坏了
 	ErrTimeout = errors.New("timeout")
 	reqsPool   = sync.Pool{
 		New: func() interface{} {
@@ -61,15 +62,17 @@ var (
 			return make(chan redisResp, 1)
 		},
 	}
-	seed int64 = 0
+	seed int64
 )
 
-func NewPool(addr []string, pwd string) *RedisPool {
+// NewPool 创建一个新的连接池
+func NewPool(addr []string, pwd string) *Pool {
 	return NewPoolSize(addr, pwd, 20)
 }
 
-func NewPoolSize(addr []string, pwd string, max int) *RedisPool {
-	var pool = &RedisPool{
+// NewPoolSize 创建一个新的连接池，并且定义连接数量
+func NewPoolSize(addr []string, pwd string, max int) *Pool {
+	var pool = &Pool{
 		connCh:      make(chan *redisConn, max),
 		badCh:       make(chan *redisConn, max),
 		reqCh:       make(chan *redisReq, 1000),
@@ -82,8 +85,9 @@ func NewPoolSize(addr []string, pwd string, max int) *RedisPool {
 	return pool
 }
 
-func (pool *RedisPool) Exec(cmd string, args ...interface{}) (interface{}, error) {
-	//log.Debug("Exec|%s|%v", cmd, args)
+// Exec 执行redis命令
+func (pool *Pool) Exec(cmd string, args ...interface{}) (interface{}, error) {
+	log.Debug("Exec|%s|%v", cmd, args)
 	ch := redisChanPool.Get().(chan redisResp)
 	pool.reqCh <- &redisReq{ch, cmd, args}
 	resp := <-ch
@@ -91,7 +95,8 @@ func (pool *RedisPool) Exec(cmd string, args ...interface{}) (interface{}, error
 	return resp.reply, resp.err
 }
 
-func (pool *RedisPool) NewAddr(addr []string, pwd string) {
+// NewAddr 切换服务器列表
+func (pool *Pool) NewAddr(addr []string, pwd string) {
 	log.Debug("NewAddr%v|%v|%v", addr, pwd)
 	pool.addrCh <- poolAddr{addr, pwd}
 }
@@ -144,9 +149,9 @@ func fetchRequests(ch chan *redisReq) (reqs []*redisReq) {
 }
 
 func processRequest(conn *redisConn, reqs []*redisReq) (err error) {
-	var slaveError error = nil
+	var slaveError error
 	if conn != nil {
-		//log.Debug("processRequest|%v|%v", conn.id, len(reqs))
+		log.Debug("processRequest|%v|%v", conn.id, len(reqs))
 		for _, req := range reqs {
 			conn.conn.Send(req.cmd, req.args...)
 		}
@@ -194,26 +199,31 @@ func processRequest(conn *redisConn, reqs []*redisReq) (err error) {
 	return
 }
 
-func (pool *RedisPool) cleanConn() {
+func (pool *Pool) cleanConn() {
+	log.Info("cleanConn")
 	for pool.total > 0 {
-		var conn *redisConn = nil
+		var conn *redisConn
 		select {
 		case conn = <-pool.connCh:
-			conn.conn.Close()
-		case conn = <-pool.connCh:
-			conn.conn.Close()
+		case conn = <-pool.badCh:
 		}
+		conn.conn.Close()
 		pool.total--
 	}
+	log.Debug("cleanConn|ok")
 }
 
-func (pool *RedisPool) checkEvent() {
-	// checkEvent再没任何消息的情况下会等待5秒
+func (pool *Pool) checkEvent() {
+	var timer *time.Timer
 	for {
-		timer := time.NewTimer(5 * time.Second)
+		if timer == nil {
+			timer = time.NewTimer(5 * time.Second)
+		} else {
+			timer.Stop()
+			timer = time.NewTimer(50 * time.Millisecond)
+		}
 		select {
 		case newMaster := <-pool.newMasterCh:
-			timer.Stop()
 			log.Info("checkEvent|newMasterCh|%v", newMaster)
 			var found = false
 			for i := 0; i < len(pool.addrs); i++ {
@@ -229,12 +239,10 @@ func (pool *RedisPool) checkEvent() {
 				log.Error("checkEvent|newMasterCh|not_found|%v", newMaster)
 			}
 		case newAddr := <-pool.addrCh:
-			timer.Stop()
 			log.Info("checkEvent|addrCh|%v", newAddr)
 			pool.cleanConn()
 			pool.poolAddr = newAddr
 		case bad := <-pool.badCh:
-			timer.Stop()
 			log.Info("checkEvent|badCh|%v|%v", bad.id, bad.addr)
 			pool.total--
 			bad.conn.Close()
@@ -244,7 +252,7 @@ func (pool *RedisPool) checkEvent() {
 	}
 }
 
-func (pool *RedisPool) checkPool() {
+func (pool *Pool) checkPool() {
 	var pos = 0
 	for pool.total < pool.max {
 		log.Debug("checkPool|%v|%v", pool.max, pool.total)
@@ -265,24 +273,21 @@ func (pool *RedisPool) checkPool() {
 	}
 }
 
-func (pool *RedisPool) testConn() {
+func (pool *Pool) testConn() {
 	// testConn每次只检查一个连接
 	var conn *redisConn
 	select {
 	case conn = <-pool.connCh:
 	default:
 		// 没有空闲的连接
-		// 表示显现比较忙
+		// 表示现在比较忙
 		// 暂时就不检查了
 		return
 	}
 
-	var addrs = pool.addrs
-	var masterAddr = addrs[0]
-	var pwd = pool.pwd
-	var now = time.Now().Unix()
+	var masterAddr = pool.addrs[0]
 	if conn.addr != masterAddr {
-		if newconn, err := makeConn(masterAddr, pwd); err != nil {
+		if newconn, err := makeConn(masterAddr, pool.pwd); err != nil {
 			log.Error("bkWorker|makeConn|%v", err)
 		} else {
 			// 主服务器已经能够连上了
@@ -290,7 +295,7 @@ func (pool *RedisPool) testConn() {
 			conn = newconn
 		}
 	}
-	if now > conn.pingTime {
+	if time.Now().Unix() > conn.pingTime {
 		// 超过pingInterval，则ping一下连接
 		if _, err := conn.conn.Do("set", "__ping", "1"); err != nil {
 			if strings.HasPrefix(err.Error(), "ERR slavewrite,") {
@@ -309,7 +314,7 @@ func (pool *RedisPool) testConn() {
 	return
 }
 
-func (pool *RedisPool) bgWorker() {
+func (pool *Pool) bgWorker() {
 	for {
 		pool.checkPool()
 		pool.testConn()
@@ -317,7 +322,7 @@ func (pool *RedisPool) bgWorker() {
 	}
 }
 
-func (pool *RedisPool) processSlaveWrite(conn *redisConn, err string) {
+func (pool *Pool) processSlaveWrite(conn *redisConn, err string) {
 	log.Info("receive|slavewrite")
 	// 主从切换了
 	if strings.HasSuffix(err, ",unknown") {
@@ -336,7 +341,7 @@ func (pool *RedisPool) processSlaveWrite(conn *redisConn, err string) {
 	}
 }
 
-func (pool *RedisPool) process() {
+func (pool *Pool) process() {
 	for {
 		var reqs = fetchRequests(pool.reqCh)
 		var timer = time.NewTimer(2 * time.Second)
@@ -363,7 +368,7 @@ func (pool *RedisPool) process() {
 	}
 }
 
-func (pool *RedisPool) start() {
+func (pool *Pool) start() {
 	go pool.bgWorker()
 	go pool.process()
 }
