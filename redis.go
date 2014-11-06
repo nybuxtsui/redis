@@ -92,7 +92,7 @@ func (pool *Pool) Exec(cmd string, args ...interface{}) (interface{}, error) {
 	pool.reqCh <- &redisReq{ch, cmd, args}
 	resp := <-ch
 	redisChanPool.Put(ch)
-	log.Debug("Exec|resp|%s|%v", resp.reply, resp.err)
+	log.Debug("Exec|resp|%v|%v", resp.reply, resp.err)
 	return resp.reply, resp.err
 }
 
